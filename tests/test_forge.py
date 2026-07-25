@@ -630,17 +630,17 @@ def test_get_batch_shapes_and_shift():
 
 
 def test_get_batch_empty_range_raises():
-    # PIN: a corpus of length exactly block_size+1 makes the sampling range
-    # empty (n = len - block - 1 == 0), so rng.integers(0, 0) raises ValueError
-    # ("high <= 0"). There is no explicit guard; this pins the current failure
-    # so a future guard change is a conscious decision.
+    # A corpus of length exactly block_size+1 makes the sampling range empty
+    # (n = len - block - 1 == 0). get_batch now raises a CLEAR ValueError naming
+    # the block size, instead of letting rng.integers(0, 0) surface a raw
+    # "high <= 0".
     ds = CharDataset("abcde", block_size=4)           # len 5 == block_size + 1
     assert len(ds.data) == ds.block_size + 1
     try:
         ds.get_batch(2, np.random.default_rng(0))
         assert False, "expected ValueError on empty sampling range"
     except ValueError as e:
-        assert "high" in str(e).lower() or "low" in str(e).lower()
+        assert "corpus too short" in str(e) and "block_size=4" in str(e)
 
 
 def test_chardataset_empty_text():
@@ -743,13 +743,11 @@ def test_save_adapters_guard_when_no_adapters():
         assert "apply_lora" in str(e)
 
 
-def test_save_adapters_unadapted_model_raises_attributeerror():
-    # PIN + BUG REPORT: on a NORMAL, un-adapted GPT, save_adapters does NOT hit
-    # its friendly "call apply_lora first" guard. _iter_head_adapters always
-    # yields the names Aq/Bq/Av/Bv, and getattr on a plain SelfAttentionHead
-    # raises AttributeError before the `if not arrays` guard is reached. So the
-    # guard only protects the empty-blocks case, not the common "forgot
-    # apply_lora" mistake. Pinning the actual current behavior.
+def test_save_adapters_unadapted_model_raises_valueerror():
+    # On a NORMAL, un-adapted GPT, save_adapters must hit its friendly
+    # "call apply_lora first" guard -- NOT an opaque AttributeError from reading
+    # Aq/Bq on a plain SelfAttentionHead. The guard checks the `_lora` flag that
+    # apply_lora sets, so it fires before any adapter attribute is touched.
     from forge.adapters import save_adapters
     import tempfile, os
     ds = CharDataset("the cat sat " * 20, block_size=16)
@@ -758,8 +756,8 @@ def test_save_adapters_unadapted_model_raises_attributeerror():
     try:
         save_adapters(m, p)
         assert False, "expected an error saving an un-adapted model"
-    except AttributeError as e:
-        assert "Aq" in str(e)                         # not the ValueError guard
+    except ValueError as e:
+        assert "apply_lora" in str(e)                 # the clear guard, not AttributeError
 
 
 def test_perplexity_short_text_guard():
@@ -798,22 +796,128 @@ def test_apply_lora_bogus_method_raises():
         assert "lora" in str(e) and "dora" in str(e)
 
 
-def test_apply_lora_gqa_base_is_unsupported():
-    # PIN + LIMITATION: apply_lora iterates `blk.attn.heads`, which only exists
-    # on MultiHeadAttention. A GQA-based backbone uses GroupedQueryAttention
-    # (no `.heads` list), so apply_lora raises AttributeError. Only MHA bases
-    # are supported today. Pinning that boundary so a future GQA adapter path
-    # is a deliberate addition.
+def _gqa_base(vocab, seed=0, n_heads=4, n_kv_heads=2):
+    # a GQA backbone: llama arch (RoPE/RMSNorm/SwiGLU) with fewer KV heads than
+    # query heads, so blk.attn is a GroupedQueryAttention rather than MHA.
+    return GPT(vocab_size=vocab, d_model=32, n_heads=n_heads, n_layers=2,
+               block_size=16, seed=seed, arch="llama", n_kv_heads=n_kv_heads)
+
+
+def test_apply_lora_gqa_swaps_attention():
+    # apply_lora now SUPPORTS a GQA backbone: it replaces each
+    # GroupedQueryAttention layer with a LoRAGroupedQueryAttention that shares
+    # the frozen Q/K/V/O and adds Q,V adapters.
     from forge.backbone.attention import GroupedQueryAttention
+    from forge.adapt import LoRAGroupedQueryAttention
     ds = CharDataset("the cat sat " * 20, block_size=16)
-    m = GPT(vocab_size=ds.vocab_size, d_model=32, n_heads=4, n_layers=2,
-            block_size=16, seed=0, arch="llama", n_kv_heads=2)
+    m = _gqa_base(ds.vocab_size)
     assert isinstance(m.blocks[0].attn, GroupedQueryAttention)
-    try:
+    apply_lora(m, rank=2, alpha=4.0)
+    assert all(isinstance(blk.attn, LoRAGroupedQueryAttention) for blk in m.blocks)
+    # the LoRA layer shares the base's frozen weights and zero-inits B (no-op).
+    for blk in m.blocks:
+        assert np.allclose(blk.attn.Bq, 0) and np.allclose(blk.attn.Bv, 0)
+
+
+def test_gqa_lora_head_gradients():
+    # GRADIENT-CHECK the GQA LoRA adapter grads in float64 with nonzero B, the
+    # same idiom as test_lora_head_gradients. No RoPE here (matches the base
+    # test_gqa_gradcheck) -- the adapter math is independent of RoPE, whose own
+    # backward is already gradient-checked.
+    from forge.backbone.attention import GroupedQueryAttention
+    from forge.adapt import LoRAGroupedQueryAttention
+    rng = np.random.default_rng(1)
+    d_model, n_heads, n_kv = 8, 4, 2
+    base = GroupedQueryAttention(d_model, n_heads, n_kv, rng)
+    for a in ("Wq", "Wk", "Wv", "Wo"):
+        setattr(base, a, getattr(base, a).astype(np.float64))
+    head = LoRAGroupedQueryAttention(base, rank=2, alpha=4.0, seed=1)
+    for a in ("Aq", "Bq", "Av", "Bv"):
+        setattr(head, a, getattr(head, a).astype(np.float64))
+    head.Bq = rng.standard_normal(head.Bq.shape) * 0.1        # nonzero B
+    head.Bv = rng.standard_normal(head.Bv.shape) * 0.1
+    x = rng.standard_normal((2, 5, d_model)).astype(np.float64)
+    w = rng.standard_normal((2, 5, d_model))                  # output is (B,T,d_model)
+    def fx(xx): return float(np.sum(head.forward(xx) * w))
+    head.forward(x); dx = head.backward(w)
+    assert rel_error(dx, numerical_grad(fx, x.copy())) < 1e-4
+    for a in ("Aq", "Bq", "Av", "Bv"):
+        P0 = getattr(head, a).copy()
+        def fP(PP, a=a):
+            setattr(head, a, PP); return float(np.sum(head.forward(x) * w))
+        head.forward(x); head.backward(w)
+        assert rel_error(getattr(head, "d" + a), numerical_grad(fP, P0.copy())) < 1e-4
+        setattr(head, a, P0)
+
+
+def test_gqa_lora_finetune_leaves_base_frozen():
+    # The frozen/trainable split must hold on a GQA backbone too: after a real
+    # fine-tune, the base Q/K/V/O and embeddings are byte-identical while the
+    # adapters have moved.
+    #
+    # np.errstate: numpy 2.0.x on darwin emits SPURIOUS "divide by zero /
+    # overflow / invalid encountered in matmul" RuntimeWarnings from the SIMD
+    # float32 matmul kernel in the base GroupedQueryAttention path (a matmul has
+    # no division, so "divide by zero" is provably not a real event -- it is a
+    # leaked FPE status flag). The base GQA model reproduces it with NO LoRA
+    # involved. We suppress that platform noise here, but the explicit isfinite
+    # assertions below still turn any GENUINE divergence into a hard failure, so
+    # nothing real is hidden.
+    ds = CharDataset("the cat sat on the mat and the dog ran " * 20, block_size=16)
+    m = _gqa_base(ds.vocab_size)
+    losses = []
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        # pretrain the FULL model briefly so the base demonstrably CAN move...
+        rng = np.random.default_rng(0); opt = Adam(lr=3e-3)
+        for _ in range(20):
+            x, y = ds.get_batch(16, rng); _, l = m.forward(x, y); m.backward()
+            opt.step(m.params_and_grads()); losses.append(float(l))
+        Wq0 = m.blocks[0].attn.Wq.copy()
+        Wk0 = m.blocks[0].attn.Wk.copy()
+        Wo0 = m.blocks[0].attn.Wo.copy()
+        tok0 = m.tok_emb.copy()
+        # ...then LoRA-adapt and train ONLY the adapters.
         apply_lora(m, rank=2, alpha=4.0)
-        assert False, "expected AttributeError adapting a GQA backbone"
-    except AttributeError as e:
-        assert "heads" in str(e)
+        opt2 = Adam(lr=5e-3)
+        for _ in range(30):
+            x, y = ds.get_batch(16, rng); _, l = m.forward(x, y); m.backward()
+            opt2.step(lora_params_and_grads(m)); losses.append(float(l))   # only adapters
+    # training stayed numerically healthy (guards against the suppression above
+    # ever masking a real blow-up)
+    assert np.isfinite(losses[-1])
+    assert np.all(np.isfinite(m.blocks[0].attn.Bq))
+    assert np.all(np.isfinite(m.blocks[0].attn.Av))
+    # base is byte-identical; only the adapters moved
+    assert np.array_equal(Wq0, m.blocks[0].attn.Wq)
+    assert np.array_equal(Wk0, m.blocks[0].attn.Wk)
+    assert np.array_equal(Wo0, m.blocks[0].attn.Wo)
+    assert np.array_equal(tok0, m.tok_emb)
+    assert not np.allclose(m.blocks[0].attn.Bq, 0)   # adapters moved off zero
+
+
+def test_gqa_lora_param_count_is_small_fraction():
+    # count_params must report the adapters as a small fraction of a GQA base.
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = _gqa_base(ds.vocab_size)
+    apply_lora(m, rank=2, alpha=4.0)
+    trainable, total = count_params(m)
+    assert 0 < trainable < total
+    assert trainable == sum(blk.attn.n_trainable() for blk in m.blocks)
+    assert trainable / total < 0.1                   # a genuinely small adapter
+
+
+def test_apply_lora_dora_on_gqa_is_not_implemented():
+    # LoRA is implemented for GQA; DoRA is not. apply_lora must refuse the DoRA
+    # method on a GQA backbone with a clear NotImplementedError rather than
+    # silently installing LoRA (which would violate the requested method) or
+    # crashing opaquely.
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = _gqa_base(ds.vocab_size)
+    try:
+        apply_lora(m, rank=2, alpha=4.0, method="dora")
+        assert False, "expected NotImplementedError for DoRA on a GQA backbone"
+    except NotImplementedError as e:
+        assert "DoRA" in str(e) and "GroupedQueryAttention" in str(e)
 
 
 # ---------------------------------------------------------------------------

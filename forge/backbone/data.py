@@ -32,6 +32,14 @@ class CharDataset:
     def get_batch(self, batch_size, rng):
         """Random (inputs, targets) where targets are inputs shifted by one."""
         n = len(self.data) - self.block_size - 1
+        if n <= 0:
+            # Need at least one valid start index i with room for x[i:i+block]
+            # AND the shifted target y[i+1:i+1+block]; that requires strictly
+            # more than block_size+1 tokens. Raise a clear error instead of
+            # letting rng.integers(0, n<=0) surface a raw "high <= 0".
+            raise ValueError(
+                f"corpus too short for block_size={self.block_size}: "
+                f"need more than {self.block_size + 1} tokens, have {len(self.data)}")
         ix = rng.integers(0, n, size=batch_size)
         x = np.stack([self.data[i:i + self.block_size] for i in ix])
         y = np.stack([self.data[i + 1:i + 1 + self.block_size] for i in ix])

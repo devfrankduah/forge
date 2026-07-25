@@ -47,6 +47,14 @@ def _iter_head_adapters(model):
 
 def save_adapters(model, path):
     """Write ONLY the adapter arrays (not the frozen base) to a .npz file."""
+    # Guard BEFORE touching any adapter attribute. On an un-adapted model the
+    # heads are plain SelfAttentionHead/GroupedQueryAttention with no
+    # Aq/Bq/Av/Bv, so building `arrays` would raise an opaque AttributeError
+    # ("no attribute 'Aq'") before the `if not arrays` check could ever fire.
+    # `_lora` is set only by apply_lora, making it the authoritative
+    # "adapters installed" signal -- detect its absence here.
+    if not getattr(model, "_lora", False):
+        raise ValueError("model has no LoRA adapters; call apply_lora first")
     arrays = {name: getattr(owner, attr) for name, owner, attr in _iter_head_adapters(model)}
     if not arrays:
         raise ValueError("model has no LoRA adapters; call apply_lora first")
