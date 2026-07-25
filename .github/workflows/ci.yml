@@ -28,6 +28,8 @@ jobs:
       - name: Install test deps
         run: |
           python -m pip install --upgrade pip
-          pip install pytest numpy
-      - name: Run tests
-        run: python -m pytest tests/ -q
+          pip install pytest coverage numpy
+      - name: Run tests (under coverage)
+        run: coverage run --source=forge -m pytest tests/ -q
+      - name: Coverage report (informational, non-blocking)
+        run: coverage report -m || true

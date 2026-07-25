@@ -417,6 +417,515 @@ def test_dora_adapter_save_load_roundtrip():
     assert np.allclose(m.blocks[0].attn.heads[0].mq, mq0)   # magnitude round-trips too
 
 
+# ===========================================================================
+# BACKBONE COVERAGE: gradcheck harness, attention internals, data pipeline
+# ---------------------------------------------------------------------------
+# The tests below exercise the frozen backbone that LoRA/DoRA sit on top of.
+# They are behavior-focused: the gradient-check idiom (upcast to float64, set
+# adapter B to a small nonzero value, compare analytic vs central-difference)
+# is the same one the existing adapter tests use. A handful PIN current
+# behavior where the production code has a genuine wart -- each is flagged with
+# a "PIN:" comment and reported, per the no-fix-production-source constraint.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# 1-2. gradcheck.py self-test: the checker itself must be trustworthy
+# ---------------------------------------------------------------------------
+
+def test_numerical_grad_matches_known_analytic():
+    # f(x) = sum(x**2)  =>  df/dx = 2x, exactly. If the central-difference
+    # helper can't reproduce a gradient we can compute by hand, every other
+    # gradient check in this suite is meaningless.
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((4, 3)).astype(np.float64)
+    def f(xx): return float(np.sum(xx ** 2))
+    num = numerical_grad(f, x.copy())
+    assert rel_error(num, 2.0 * x) < 1e-6
+
+
+def test_rel_error_bounds_and_zero_safety():
+    # Identical arrays => ~0; exact opposites => ~1; all-zero inputs must NOT
+    # divide by zero (the 1e-12 denom floor guards it).
+    rng = np.random.default_rng(1)
+    v = rng.standard_normal((5, 5)).astype(np.float64)
+    assert rel_error(v, v) == 0.0
+    assert abs(rel_error(v, -v) - 1.0) < 1e-12
+    z = np.zeros((3, 3))
+    err = rel_error(z, z)
+    assert np.isfinite(err) and err == 0.0
+
+
+def test_run_all_checks_passes():
+    # The bundled gradient check over all five primitives (Matmul, Softmax,
+    # LayerNorm, GELU, CrossEntropy) must return True.
+    from forge.backbone.gradcheck import run_all_checks
+    assert run_all_checks(seed=0) is True
+
+
+# ---------------------------------------------------------------------------
+# 3. Base (frozen) SelfAttentionHead backward -- the plain head, no adapters
+# ---------------------------------------------------------------------------
+
+def test_base_head_backward_gradcheck():
+    rng = np.random.default_rng(0)
+    C, hd = 8, 8
+    head = SelfAttentionHead(C, hd, rng)
+    for a in ("Wq", "Wk", "Wv"):
+        setattr(head, a, getattr(head, a).astype(np.float64))
+    x = rng.standard_normal((2, 5, C)).astype(np.float64)
+    w = rng.standard_normal((2, 5, hd))
+    def fx(xx): return float(np.sum(head.forward(xx) * w))
+    head.forward(x); dx = head.backward(w)
+    assert rel_error(dx, numerical_grad(fx, x.copy())) < 1e-4
+    for a in ("Wq", "Wk", "Wv"):
+        P0 = getattr(head, a).copy()
+        def fP(PP, a=a):
+            setattr(head, a, PP); return float(np.sum(head.forward(x) * w))
+        head.forward(x); head.backward(w)
+        assert rel_error(getattr(head, "d" + a), numerical_grad(fP, P0.copy())) < 1e-4
+        setattr(head, a, P0)
+
+
+# ---------------------------------------------------------------------------
+# 4-5. Causal masking and attention-weight shape guarantees
+# ---------------------------------------------------------------------------
+
+def test_causal_mask_is_lower_triangular():
+    from forge.backbone.attention import causal_mask
+    T = 6
+    m = causal_mask(T)
+    assert m.shape == (T, T) and m.dtype == bool
+    # row 0 may attend only to itself; the last row may attend to all T.
+    assert m[0].sum() == 1
+    assert m[T - 1].sum() == T
+    # strictly lower-triangular-inclusive: no True above the diagonal.
+    assert not m[np.triu_indices(T, k=1)].any()
+
+
+def test_attention_weights_causal_and_row_normalized():
+    rng = np.random.default_rng(2)
+    C, hd, T = 8, 8, 5
+    head = SelfAttentionHead(C, hd, rng)
+    x = rng.standard_normal((2, T, C)).astype(np.float64)
+    head.forward(x)
+    att = head.att                                   # (B,T,T)
+    # every query row is a probability distribution over keys
+    assert np.allclose(att.sum(axis=-1), 1.0)
+    # future positions get ~zero weight. The mask sentinel is -1e9 (not -inf),
+    # so use atol rather than exact-zero.
+    iu = np.triu_indices(T, k=1)
+    assert np.max(np.abs(att[:, iu[0], iu[1]])) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 6. KV-cache inference path matches the masked slow path
+# ---------------------------------------------------------------------------
+
+def test_kv_cache_matches_slow_path():
+    rng = np.random.default_rng(0)
+    C, hd, T = 8, 8, 4
+    head = SelfAttentionHead(C, hd, rng)
+    for a in ("Wq", "Wk", "Wv"):
+        setattr(head, a, getattr(head, a).astype(np.float64))
+    x = rng.standard_normal((1, T, C)).astype(np.float64)
+    slow = head.forward(x)                            # full causal attention
+    # feed the SAME prefix one token at a time through the cache
+    head.reset_cache()
+    last = None
+    for pos in range(T):
+        last = head.forward_cached(x[:, pos:pos + 1, :], pos)
+    # the incremental final-token output must equal the slow path's last row
+    assert np.allclose(last[:, 0, :], slow[:, -1, :], atol=1e-9)
+
+
+def test_kv_cache_sliding_window_cap():
+    rng = np.random.default_rng(0)
+    C, hd = 8, 8
+    head = SelfAttentionHead(C, hd, rng)
+    x = rng.standard_normal((1, 1, C)).astype(np.float64)
+    head.reset_cache()
+    cap = 3
+    for pos in range(10):
+        head.forward_cached(x, pos, max_context=cap)
+    # the cache is a sliding window: it never grows past max_context
+    assert head._k_cache.shape[1] == cap
+    assert head._v_cache.shape[1] == cap
+
+
+def test_rope_at_clamps_past_table():
+    from forge.backbone.rope import RoPE
+    rng = np.random.default_rng(0)
+    rope = RoPE(8, max_seq=4)                         # table covers positions 0..3
+    head = SelfAttentionHead(8, 8, rng, rope=rope)
+    x1 = rng.standard_normal((1, 1, 8)).astype(np.float64)
+    past = head._rope_at(x1, 100)                     # way past the table
+    clamped = head._rope_at(x1, 3)                    # last valid index
+    assert np.all(np.isfinite(past))
+    assert np.allclose(past, clamped)                 # clamped, not out-of-bounds
+
+
+# ---------------------------------------------------------------------------
+# 7. GroupedQueryAttention: repeat-then-sum-back KV grad + config guards
+# ---------------------------------------------------------------------------
+
+def test_gqa_gradcheck():
+    from forge.backbone.attention import GroupedQueryAttention
+    rng = np.random.default_rng(1)
+    d_model, n_heads, n_kv = 8, 4, 2
+    gqa = GroupedQueryAttention(d_model, n_heads, n_kv, rng)
+    for a in ("Wq", "Wk", "Wv", "Wo"):
+        setattr(gqa, a, getattr(gqa, a).astype(np.float64))
+    x = rng.standard_normal((2, 5, d_model)).astype(np.float64)
+    w = rng.standard_normal((2, 5, d_model))
+    def fx(xx): return float(np.sum(gqa.forward(xx) * w))
+    gqa.forward(x); dx = gqa.backward(w)
+    assert rel_error(dx, numerical_grad(fx, x.copy())) < 1e-4
+    # Wk/Wv carry the repeat-then-sum-back KV gradient (each KV head is shared
+    # by a group of query heads); Wq/Wo are ordinary. Check all four.
+    for a in ("Wq", "Wk", "Wv", "Wo"):
+        P0 = getattr(gqa, a).copy()
+        def fP(PP, a=a):
+            setattr(gqa, a, PP); return float(np.sum(gqa.forward(x) * w))
+        gqa.forward(x); gqa.backward(w)
+        assert rel_error(getattr(gqa, "d" + a), numerical_grad(fP, P0.copy())) < 1e-4
+        setattr(gqa, a, P0)
+
+
+def test_gqa_kv_cache_saving_ratio():
+    from forge.backbone.attention import GroupedQueryAttention
+    rng = np.random.default_rng(0)
+    gqa = GroupedQueryAttention(8, 4, 2, rng)
+    # 4 query heads sharing 2 KV heads => the KV-cache is 2x smaller
+    assert gqa.kv_cache_saving() == 2.0
+    mqa = GroupedQueryAttention(8, 4, 1, rng)         # multi-query extreme
+    assert mqa.kv_cache_saving() == 4.0
+
+
+def test_gqa_bad_config_raises():
+    from forge.backbone.attention import GroupedQueryAttention
+    rng = np.random.default_rng(0)
+    # n_heads must be a multiple of n_kv_heads (4 % 3 != 0). d_model=8 is
+    # divisible by n_heads=4, so the *n_kv_heads* assert is the one that fires.
+    try:
+        GroupedQueryAttention(8, 4, 3, rng)
+        assert False, "expected AssertionError for n_heads % n_kv_heads != 0"
+    except AssertionError as e:
+        assert "multiple" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# 8-9. CharDataset: batch window math and tokenization edge cases
+# ---------------------------------------------------------------------------
+
+def test_get_batch_shapes_and_shift():
+    ds = CharDataset("the cat sat on the mat " * 20, block_size=8)
+    rng = np.random.default_rng(0)
+    batch = 5
+    x, y = ds.get_batch(batch, rng)
+    assert x.shape == (batch, ds.block_size)
+    assert y.shape == (batch, ds.block_size)
+    # target is the input shifted by one: y[b, j] == x[b, j+1] for all j.
+    assert np.array_equal(y[:, :-1], x[:, 1:])
+
+
+def test_get_batch_empty_range_raises():
+    # PIN: a corpus of length exactly block_size+1 makes the sampling range
+    # empty (n = len - block - 1 == 0), so rng.integers(0, 0) raises ValueError
+    # ("high <= 0"). There is no explicit guard; this pins the current failure
+    # so a future guard change is a conscious decision.
+    ds = CharDataset("abcde", block_size=4)           # len 5 == block_size + 1
+    assert len(ds.data) == ds.block_size + 1
+    try:
+        ds.get_batch(2, np.random.default_rng(0))
+        assert False, "expected ValueError on empty sampling range"
+    except ValueError as e:
+        assert "high" in str(e).lower() or "low" in str(e).lower()
+
+
+def test_chardataset_empty_text():
+    ds = CharDataset("", block_size=4)
+    assert ds.vocab_size == 0
+    assert ds.stoi == {} and ds.itos == {}
+    assert ds.data.shape == (0,)
+
+
+def test_chardataset_encode_unseen_raises():
+    ds = CharDataset("abc", block_size=2)
+    try:
+        ds.encode("z")                                # 'z' not in the vocab
+        assert False, "expected KeyError for an unseen character"
+    except KeyError:
+        pass
+
+
+def test_chardataset_decode_encode_roundtrip():
+    ds = CharDataset("the quick brown fox", block_size=4)
+    s = "brown fox"
+    assert ds.decode(ds.encode(s)) == s
+
+
+# ---------------------------------------------------------------------------
+# 10-11. adapters.py save/load error paths and perplexity guards
+# ---------------------------------------------------------------------------
+
+def _adapted_base(seed=0, rank=2, method="lora"):
+    ds = CharDataset("the cat sat on the mat " * 30, block_size=16)
+    m = _tiny_base(ds.vocab_size, seed=seed)
+    apply_lora(m, rank=rank, alpha=4.0, method=method)
+    return ds, m
+
+
+def test_load_adapters_missing_key_raises():
+    from forge.adapters import load_adapters
+    import tempfile, os
+    _, m = _adapted_base()
+    p = os.path.join(tempfile.mkdtemp(), "bad.npz")
+    # a .npz that lacks every expected adapter key
+    np.savez(p, __meta__=np.array([2, 2], dtype=np.int64), junk=np.zeros(3))
+    try:
+        load_adapters(m, p)
+        assert False, "expected KeyError for a missing adapter key"
+    except KeyError as e:
+        assert "missing" in str(e)
+
+
+def test_load_adapters_shape_mismatch_raises():
+    from forge.adapters import save_adapters, load_adapters
+    import tempfile, os
+    ds = CharDataset("the cat sat on the mat " * 30, block_size=16)
+    m2 = _tiny_base(ds.vocab_size); apply_lora(m2, rank=2, alpha=4.0)
+    p = os.path.join(tempfile.mkdtemp(), "r2.npz")
+    save_adapters(m2, p)
+    # a model with a DIFFERENT rank has incompatible adapter shapes
+    m4 = _tiny_base(ds.vocab_size); apply_lora(m4, rank=4, alpha=4.0)
+    try:
+        load_adapters(m4, p)
+        assert False, "expected ValueError for a shape mismatch"
+    except ValueError as e:
+        assert "shape" in str(e)
+
+
+def test_load_adapters_npz_suffix_append_branch():
+    from forge.adapters import save_adapters, load_adapters
+    import tempfile, os
+    _, m = _adapted_base()
+    rng = np.random.default_rng(0)
+    for blk in m.blocks:
+        for h in blk.attn.heads:
+            h.Bq = rng.standard_normal(h.Bq.shape).astype(np.float32) * 0.1
+    noext = os.path.join(tempfile.mkdtemp(), "ad")    # NO .npz suffix
+    save_adapters(m, noext)                           # np.savez appends .npz
+    assert os.path.exists(noext + ".npz")
+    before = m.blocks[0].attn.heads[0].Bq.copy()
+    for blk in m.blocks:
+        for h in blk.attn.heads:
+            h.Bq = np.zeros_like(h.Bq)
+    # loading with the suffix-less path exercises the ".npz"-append branch
+    loaded = load_adapters(m, noext)
+    assert loaded > 0
+    assert np.allclose(m.blocks[0].attn.heads[0].Bq, before)
+
+
+def test_save_adapters_guard_when_no_adapters():
+    from forge.adapters import save_adapters
+    import tempfile, os
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = _tiny_base(ds.vocab_size)
+    # an adapter-free model: empty the blocks so the adapter iterator yields
+    # nothing and the explicit guard fires (rather than an AttributeError).
+    m.blocks = []
+    p = os.path.join(tempfile.mkdtemp(), "empty.npz")
+    try:
+        save_adapters(m, p)
+        assert False, "expected ValueError when there are no adapters"
+    except ValueError as e:
+        assert "apply_lora" in str(e)
+
+
+def test_save_adapters_unadapted_model_raises_attributeerror():
+    # PIN + BUG REPORT: on a NORMAL, un-adapted GPT, save_adapters does NOT hit
+    # its friendly "call apply_lora first" guard. _iter_head_adapters always
+    # yields the names Aq/Bq/Av/Bv, and getattr on a plain SelfAttentionHead
+    # raises AttributeError before the `if not arrays` guard is reached. So the
+    # guard only protects the empty-blocks case, not the common "forgot
+    # apply_lora" mistake. Pinning the actual current behavior.
+    from forge.adapters import save_adapters
+    import tempfile, os
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = _tiny_base(ds.vocab_size)                     # never adapted
+    p = os.path.join(tempfile.mkdtemp(), "x.npz")
+    try:
+        save_adapters(m, p)
+        assert False, "expected an error saving an un-adapted model"
+    except AttributeError as e:
+        assert "Aq" in str(e)                         # not the ValueError guard
+
+
+def test_perplexity_short_text_guard():
+    from forge.adapters import perplexity
+    _, m = _adapted_base()
+    ds = CharDataset("the cat sat on the mat " * 30, block_size=16)
+    # text shorter than block_size + 1 tokens must raise, not silently divide
+    try:
+        perplexity(m, ds, "the")
+        assert False, "expected ValueError for too-short text"
+    except ValueError as e:
+        assert "short" in str(e)
+
+
+def test_perplexity_stride_not_block_branch():
+    from forge.adapters import perplexity
+    _, m = _adapted_base()
+    ds = CharDataset("the cat sat on the mat " * 30, block_size=16)
+    text = "the cat sat on the mat " * 6
+    # stride < block => overlapping windows; each window is weighted by `block`
+    ppl = perplexity(m, ds, text, block_size=8, stride=4)
+    assert np.isfinite(ppl) and ppl > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 12. apply_lora dispatch: bad method + the MHA-only limitation
+# ---------------------------------------------------------------------------
+
+def test_apply_lora_bogus_method_raises():
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = _tiny_base(ds.vocab_size)
+    try:
+        apply_lora(m, rank=2, alpha=4.0, method="bogus")
+        assert False, "expected ValueError for an unknown adapter method"
+    except ValueError as e:
+        assert "lora" in str(e) and "dora" in str(e)
+
+
+def test_apply_lora_gqa_base_is_unsupported():
+    # PIN + LIMITATION: apply_lora iterates `blk.attn.heads`, which only exists
+    # on MultiHeadAttention. A GQA-based backbone uses GroupedQueryAttention
+    # (no `.heads` list), so apply_lora raises AttributeError. Only MHA bases
+    # are supported today. Pinning that boundary so a future GQA adapter path
+    # is a deliberate addition.
+    from forge.backbone.attention import GroupedQueryAttention
+    ds = CharDataset("the cat sat " * 20, block_size=16)
+    m = GPT(vocab_size=ds.vocab_size, d_model=32, n_heads=4, n_layers=2,
+            block_size=16, seed=0, arch="llama", n_kv_heads=2)
+    assert isinstance(m.blocks[0].attn, GroupedQueryAttention)
+    try:
+        apply_lora(m, rank=2, alpha=4.0)
+        assert False, "expected AttributeError adapting a GQA backbone"
+    except AttributeError as e:
+        assert "heads" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# 13. LoRALinear scaling / rank edge cases + 2-D input gradient check
+# ---------------------------------------------------------------------------
+
+def test_lora_rank1_nonunit_scaling_merged_matches_forward():
+    # rank=1 with alpha != rank => scaling != 1. The merged weight must still
+    # reproduce forward exactly, proving the alpha/r factor lands in both paths.
+    rng = np.random.default_rng(0)
+    W = rng.standard_normal((6, 5)).astype(np.float64)
+    lora = LoRALinear(W, rank=1, alpha=3.0, seed=2)   # scaling = 3.0
+    assert lora.scaling == 3.0
+    lora.A = lora.A.astype(np.float64)
+    lora.B = rng.standard_normal((1, 5)) * 0.1
+    x = rng.standard_normal((3, 6)).astype(np.float64)
+    fwd = lora.forward(x)
+    assert np.allclose(fwd, x @ lora.merged_weight())
+    # and the update really is scaled by alpha/r (not absorbed elsewhere)
+    manual = x @ W + (x @ lora.A @ lora.B) * lora.scaling
+    assert np.allclose(fwd, manual)
+
+
+def test_lora_2d_input_gradcheck():
+    # the existing LoRA grad tests use a 3-D (B,T,in) input; this pins the
+    # leading-dim flattening for a plain 2-D (N,in) matrix.
+    rng = np.random.default_rng(2)
+    W = rng.standard_normal((6, 5)).astype(np.float64)
+    lora = LoRALinear(W, rank=1, alpha=3.0, seed=2)
+    lora.A = lora.A.astype(np.float64)
+    lora.B = rng.standard_normal((1, 5)) * 0.1
+    x = rng.standard_normal((4, 6)).astype(np.float64)     # (N, in)
+    w = rng.standard_normal((4, 5))
+    def fx(xx): return float(np.sum(lora.forward(xx) * w))
+    lora.forward(x); dx = lora.backward(w)
+    assert rel_error(dx, numerical_grad(fx, x.copy())) < 1e-4
+    A0 = lora.A.copy(); B0 = lora.B.copy()
+    def fA(AA): lora.A = AA; return float(np.sum(lora.forward(x) * w))
+    lora.forward(x); lora.backward(w)
+    assert rel_error(lora.dA, numerical_grad(fA, A0.copy())) < 1e-4
+    lora.A = A0
+    def fB(BB): lora.B = BB; return float(np.sum(lora.forward(x) * w))
+    lora.forward(x); lora.backward(w)
+    assert rel_error(lora.dB, numerical_grad(fB, B0.copy())) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# 14. DoRA numerical stability and merge equivalence
+# ---------------------------------------------------------------------------
+
+def test_dora_tiny_column_norm_stays_finite():
+    # A near-zero weight column drives ||V||_col toward the 1e-8 eps floor.
+    # dora_compose/dora_grads must stay finite (no 0/0), which is exactly what
+    # the eps inside _col_norm buys us.
+    from forge.dora import dora_compose, dora_grads
+    rng = np.random.default_rng(3)
+    W = rng.standard_normal((6, 5)).astype(np.float64)
+    W[:, 0] = 1e-13                                    # essentially a zero column
+    A = rng.standard_normal((6, 2)) * 0.01
+    B = np.zeros((2, 5))
+    m = np.sqrt(np.sum(W * W, axis=0) + 1e-8)          # init magnitude = col norm
+    Wp, V, n = dora_compose(W, A, B, m, scaling=2.0)
+    assert np.all(np.isfinite(Wp)) and np.all(n > 0)
+    dWp = rng.standard_normal((6, 5))
+    dA, dB, dm = dora_grads(dWp, V, n, m, A, B, scaling=2.0)
+    assert np.all(np.isfinite(dA))
+    assert np.all(np.isfinite(dB))
+    assert np.all(np.isfinite(dm))
+
+
+def test_dora_merged_matches_forward_nondefault():
+    # non-default rank AND alpha (=> non-default scaling): the folded weight
+    # must still equal the forward pass.
+    from forge.dora import DoRALinear
+    rng = np.random.default_rng(0)
+    W = rng.standard_normal((6, 5)).astype(np.float64)
+    d = DoRALinear(W, rank=3, alpha=5.0, seed=1)       # scaling = 5/3
+    assert abs(d.scaling - 5.0 / 3.0) < 1e-12
+    d.B = rng.standard_normal((3, 5)) * 0.1
+    d.m = d.m.astype(np.float64) + 0.03                # move magnitude off init
+    x = rng.standard_normal((4, 6)).astype(np.float64)
+    assert np.allclose(d.forward(x), x @ d.merged_weight())
+
+
+# ---------------------------------------------------------------------------
+# 15. SMOKE: entrypoint glue imports and cheapest pure helpers run
+# ---------------------------------------------------------------------------
+
+def test_smoke_entrypoints_import_and_run():
+    # Import the three CLI/web entrypoints (glue only -- never call serve() or a
+    # full training main()) and run their cheapest pure helper for one step.
+    import forge.demo as demo
+    import forge.web as web            # noqa: F401  (import-only: don't serve)
+    import forge.compare_dora as compare_dora
+
+    # compare_dora._fit: one Adam step on a tiny LoRA adapter fitting x->target
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((6, 4)) / np.sqrt(6)).astype(np.float32)
+    x = rng.standard_normal((8, 6)).astype(np.float32)
+    target = rng.standard_normal((8, 4)).astype(np.float32)
+    lora = LoRALinear(W, rank=2, alpha=4.0, seed=1)
+    hist = compare_dora._fit(lora, x, target, steps=1, lr=1e-2)
+    assert len(hist) == 1 and np.isfinite(hist[0])
+
+    # demo._train_on: one training step on a tiny GPT (glue path, not main())
+    ds = CharDataset("the cat sat on the mat " * 5, block_size=8)
+    m = GPT(vocab_size=ds.vocab_size, d_model=16, n_heads=2, n_layers=1,
+            block_size=8, seed=0)
+    hist2 = demo._train_on(m, ds, "the cat sat on the mat " * 5, steps=1, lr=1e-3)
+    assert len(hist2) == 1 and np.isfinite(hist2[0])
+
+
 if __name__ == "__main__":
 
 
