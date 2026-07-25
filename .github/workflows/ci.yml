@@ -1,0 +1,33 @@
+name: forge-ci
+
+# Runs the test suite on every push to main and on every pull request, across
+# the full range of Python versions forge claims to support
+# (requires-python = ">=3.9"). forge depends on NumPy; numpy is left unpinned so
+# pip resolves a version appropriate to each Python in the matrix (the test
+# suite is verified green on numpy 2.x). The package itself is not installed:
+# the test files inject the repo root onto sys.path, so pytest resolves imports
+# without an editable install.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # one Python version failing must not hide the others
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy
+      - name: Run tests
+        run: python -m pytest tests/ -q
