@@ -9,6 +9,18 @@ dependencies = ["numpy>=1.21"]
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
 
+[tool.pytest.ini_options]
+# Silence ONLY the spurious "<op> encountered in matmul" RuntimeWarnings: the
+# vendored float32 base transformer leaks floating-point status flags from the
+# SIMD matmul kernel on some platforms (numpy 2.0 / macOS). A matmul has no
+# division, so "divide by zero in matmul" cannot be a real error. Numerical
+# health is still enforced by the gradient checks and np.isfinite assertions in
+# the suite. (pytest manages warnings per-test, so the module-level filter in
+# tests/test_forge.py only covers the no-pytest script runner; this covers pytest.)
+filterwarnings = [
+    "ignore:.*encountered in matmul:RuntimeWarning",
+]
+
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"

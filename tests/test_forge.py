@@ -11,10 +11,22 @@ Self-contained: no external dependency, just run it (NumPy only).
 
 import os
 import sys
+import warnings
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import numpy as np
+
+# The vendored float32 base transformer trips SPURIOUS RuntimeWarnings
+# ("divide by zero / overflow / invalid value encountered in matmul") from the
+# SIMD matmul kernel on some platforms (seen on numpy 2.0 / macOS). A matmul has
+# no division, so "divide by zero in matmul" cannot be a real error -- these are
+# leaked floating-point status flags, not bad values. Real numerical health is
+# still checked by the gradient checks and explicit np.isfinite assertions
+# below, so we silence ONLY this specific, provably-spurious message (never
+# RuntimeWarnings in general).
+warnings.filterwarnings("ignore", message=r".*encountered in matmul",
+                        category=RuntimeWarning)
 
 from forge.backbone.model import GPT
 from forge.backbone.data import CharDataset
