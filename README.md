@@ -1,5 +1,7 @@
 # Forge
 
+[![CI](https://github.com/devfrankduah/forge/actions/workflows/ci.yml/badge.svg)](https://github.com/devfrankduah/forge/actions/workflows/ci.yml)
+
 **LoRA fine-tuning and its modern successors, implemented from scratch — adapt a
 frozen transformer by training a few percent of it, with the base provably
 untouched (and optionally int8-quantized to cut its memory ~4x).**
