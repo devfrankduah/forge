@@ -24,7 +24,7 @@ numbers but the adapter has just 512*8 + 8*512 = 8,192 -- about 3%. That's the
 whole win.
 
 WHY LOW-RANK IS A REASONABLE CONSTRAINT
---------------------------------------------------------------------
+---------------------------------------
 The hypothesis behind LoRA is that the *change* a model needs to adapt to a new
 task has low "intrinsic rank" -- it lives in a small subspace, even though the
 weights themselves are full-rank. Empirically that holds surprisingly well, and

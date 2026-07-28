@@ -16,7 +16,7 @@ evaluation are included.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-numpy%20only-brightgreen)
-![Tests](https://img.shields.io/badge/tests-24%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-59%20passing-brightgreen)
 ![Gradients](https://img.shields.io/badge/gradients-checked%20to%201e--8-brightgreen)
 
 ---

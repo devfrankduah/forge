@@ -11,3 +11,10 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# model / data files
+*.gguf
+*.pt
+*.pth
+*.npz
+*.bin
