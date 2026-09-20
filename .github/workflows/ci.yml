@@ -12,6 +12,9 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  # Lets CI be re-run on demand, so a months-old green result can be
+  # re-confirmed without pushing an empty commit.
+  workflow_dispatch:
 
 jobs:
   tests:
